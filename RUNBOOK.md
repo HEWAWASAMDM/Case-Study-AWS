@@ -140,8 +140,9 @@ kubectl get nodes
 
 ### 3.1 Transfer the "New Event" template to EC2
 ```bash
-# On LOCAL machine (WSL), after downloading the zip via browser to Downloads:
-scp -i cw-k8s-key.pem "/mnt/c/Users/ASUS/Downloads/tm-486-new-event.zip" ubuntu@<PUBLIC_IP>:~/
+# Download the HTML Template onto the EC2 Instance
+:
+wget https://templatemo.com/download/templatemo_486_new_event -O new-event.zip
 
 # On EC2:
 sudo apt install -y unzip
