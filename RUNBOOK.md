@@ -1,9 +1,8 @@
-# CMM707 Cloud Computing Coursework — Deployment Runbook
+# The deployment of this frontend application alongside a set of backend microservices and an analytics infrastructure. — Deployment Runbook
 
 **Author:** Dinithi Hewawasam
-**Last updated:** 19 July 2026
-**Purpose:** Step-by-step, reproducible instructions to deploy the "New Event" frontend
-and supporting infrastructure on a self-managed k3s Kubernetes cluster on AWS EC2.
+
+
 
 ---
 
