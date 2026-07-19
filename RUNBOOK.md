@@ -350,7 +350,18 @@ def delete_event(event_id: str):
     del events_db[event_id]
     return {"message": "Event deleted"}
 ```
+Test it locally
 
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+```
+
+```bash
+curl http://localhost:8001/
+curl -X POST http://localhost:8001/events \
+  -H "Content-Type: application/json" \
+  -d '{"event_id":"EVT001","title":"Cloud Summit","venue":"Main Hall","date_time":"2026-08-01T09:00:00","ticket_price":25.0,"capacity":100,"seats_available":8}'
+```
 ### Step 5.3 — Program Service
 
 ### Set up the service folder
