@@ -1046,9 +1046,247 @@ SELECT * FROM registrations;
 # From local WSL terminal
 aws rds describe-db-instances --db-instance-identifier cw-event-db --query "DBInstances[0].Endpoint.Address" --output text
 ```
+### Step 7.1 — Verify Your Email in SES
+```bash
+```bash
+# From local WSL terminal
+aws rds describe-db-instances --db-instance-identifier cw-event-db --query "DBInstances[0].Endpoint.Address" --output text
+```
+### Step 7.2 — IAM Role for the Lambda Function
+Create the trust policy 
+```bash
+cat > lambda-trust-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "lambda.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+```
+Create the role
 
-> **TODO (future step):** Allocate an Elastic IP so the public IP stops changing —
-> planned before CI/CD stage / viva demo.
+```bash
+aws iam create-role \
+  --role-name cw-lambda-ses-role \
+  --assume-role-policy-document file://lambda-trust-policy.json
+```
+Attach permissions — SES send access + basic Lambda logging
 
+```bash
+aws iam attach-role-policy \
+  --role-name cw-lambda-ses-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSESFullAccess
+
+aws iam attach-role-policy \
+  --role-name cw-lambda-ses-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+```
+
+Get the role's ARN
+
+```bash
+aws iam get-role --role-name cw-lambda-ses-role --query "Role.Arn" --output text
+```
+### Step 7.3 — Write and Deploy the Lambda Function
+
+Create the function code locally
+```bash
+mkdir -p ~/lambda-low-seats
+cd ~/lambda-low-seats
+```
+```bash
+cat > lambda_function.py << 'EOF'
+import boto3
+import os
+
+ses_client = boto3.client('ses', region_name='eu-west-1')
+
+SENDER = os.environ.get('SENDER_EMAIL', 'dinithimuthuwanthih@gmail.com')
+RECIPIENT = os.environ.get('RECIPIENT_EMAIL', 'dinithimuthuwanthih@gmail.com')
+
+def lambda_handler(event, context):
+    event_id = event.get('event_id', 'UNKNOWN')
+    seats_left = event.get('seats_left', 'UNKNOWN')
+
+    subject = f"Low Seat Alert: Event {event_id}"
+    body_text = (
+        f"Event {event_id} has only {seats_left} seats remaining.\n\n"
+        f"This is an automated notification from the New Event platform."
+    )
+
+    response = ses_client.send_email(
+        Source=SENDER,
+        Destination={'ToAddresses': [RECIPIENT]},
+        Message={
+            'Subject': {'Data': subject},
+            'Body': {'Text': {'Data': body_text}}
+        }
+    )
+
+    return {
+        'statusCode': 200,
+        'body': f"Notification sent for event {event_id}, message ID: {response['MessageId']}"
+    }
+EOF
+```
+Package it into a zip (Lambda deployment format)
+```bash
+zip lambda_function.zip lambda_function.py
+```
+### Create the Lambda function in AWS
+
+```bash
+aws lambda create-function \
+  --function-name low-seats-notification \
+  --runtime python3.12 \
+  --role arn:aws:iam::108405836017:role/cw-lambda-ses-role \
+  --handler lambda_function.lambda_handler \
+  --zip-file fileb://lambda_function.zip \
+  --timeout 10
+
+```
+Test it directly
+
+```bash
+aws lambda invoke \
+  --function-name low-seats-notification \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"event_id":"EVT001","seats_left":6}' \
+  response.json
+
+cat response.json
+```
+### Step 7.4 — Give EC2 Permission to Invoke Lambda
+
+Create a trust policy for EC2
+```bash
+cat > ec2-trust-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ec2.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+```
+
+Create the role and attach Lambda invoke permission
+
+```bash
+aws iam create-role \
+  --role-name cw-ec2-lambda-invoke-role \
+  --assume-role-policy-document file://ec2-trust-policy.json
+
+aws iam attach-role-policy \
+  --role-name cw-ec2-lambda-invoke-role \
+  --policy-arn arn:aws:iam::aws:policy/AWSLambda_FullAccess
+```
+Create an "instance profile" (the actual thing that attaches a role to an EC2 instance)
+
+```bash
+aws iam create-instance-profile --instance-profile-name cw-ec2-lambda-profile
+
+aws iam add-role-to-instance-profile \
+  --instance-profile-name cw-ec2-lambda-profile \
+  --role-name cw-ec2-lambda-invoke-role
+```
+
+Attach the instance profile to your running EC2 instance
+```bash
+aws ec2 associate-iam-instance-profile \
+  --instance-id i-0c3c8be754055de5f \
+  --iam-instance-profile Name=cw-ec2-lambda-profile
+```
+### Step 7.5 — Wire the Real Lambda Call into Registration Service
+
+```bash
+cd ~/microservices/registration-service
+source venv/bin/activate
+pip install boto3
+pip freeze | grep -iE "fastapi|uvicorn|pydantic|sqlalchemy|psycopg2|boto3" > requirements.txt
+cat requirements.txt
+```
+Update main.py — replace the placeholder function
+
+```bash
+
+nano main.py
+from fastapi import FastAPI, HTTPException, Depends
+from sqlalchemy.orm import Session
+from pydantic import BaseModel, EmailStr
+from datetime import datetime
+import uuid
+
+from database import engine, get_db, Base
+from models import RegistrationDB, EventDB
+
+from database import engine, get_db, Base
+from models import RegistrationDB, EventDB
+import boto3
+import json
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Registration Service")
+
+LOW_SEATS_THRESHOLD = 10
+
+class RegistrationRequest(BaseModel):
+    event_id: str
+    name: str
+    email: EmailStr
+    ticket_count: int
+
+class Registration(RegistrationRequest):
+    registration_id: str
+    timestamp: datetime
+
+    class Config:
+        from_attributes = True
+
+@app.get("/")
+def root():
+    return {"service": "Registration Service", "status": "running"}
+
+@app.post("/registrations", response_model=Registration)
+def create_registration(reg: RegistrationRequest, db: Session = Depends(get_db)):
+    event = db.query(EventDB).filter(EventDB.event_id == reg.event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    if reg.ticket_count > event.seats_available:
+        raise HTTPException(status_code=400, detail="Not enough seats available")
+
+    # Deduct seats directly on the real Event Service table
+    event.seats_available -= reg.ticket_count
+
+    registration = RegistrationDB(
+        registration_id=str(uuid.uuid4()),
+        timestamp=datetime.utcnow(),
+        **reg.dict()
+    )
+    db.add(registration)
+    db.commit()
+    db.refresh(registration)
+    db.refresh(event)
+
+```
+Verify the change and restart
+```bash
+grep -n "boto3\|lambda_client\|InvocationType" main.py
+```
 ---
 
