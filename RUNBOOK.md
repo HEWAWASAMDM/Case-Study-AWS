@@ -679,77 +679,368 @@ kubectl run test-curl --image=curlimages/curl -it --rm --restart=Never -- curl h
 
 ### Q3 - Saving Transactional Data 
 
-### Step 6.1 — Create the RDS Instance
 
+### 6.1 Create the RDS PostgreSQL instance
+Create the RDS instance with the required engine version and instance class.
 ```bash
-aws rds create-db-instance \
-  --db-instance-identifier cw-event-db \
-  --db-instance-class db.t3.micro \
-  --engine postgres \
-  --engine-version 16.9 \
-  --master-username cwadmin \
-  --master-user-password 'ChangeThisPassword123!' \
-  --allocated-storage 20 \
-  --publicly-accessible \
-  --backup-retention-period 0
+aws rds create-db-instance --db-instance-identifier cw-event-db --db-instance-class db.t3.micro --engine postgres --engine-version 16.9 --master-username cwadmin --master-user-password '<password>' --allocated-storage 20 --publicly-accessible --backup-retention-period 0
 ```
 
-### Step 6.2 — Get the RDS Endpoint & Lock Down Access
-
+### 6.2 Retrieve the endpoint and restrict access
+Get the endpoint and security group, then restrict inbound access to the microservices' security group.
 ```bash
-aws rds describe-db-instances \
-  --db-instance-identifier cw-event-db \
-  --query "DBInstances[0].Endpoint.Address" \
-  --output text
-```
- your microservices will use to connect — RDS doesn't use a fixed IP, it uses this DNS name, which AWS manages behind the scenes.
+aws rds describe-db-instances --db-instance-identifier cw-event-db --query "DBInstances[0].Endpoint.Address" --output text
 
- Get the RDS security group ID 
+aws rds describe-db-instances --db-instance-identifier cw-event-db --query "DBInstances[0].VpcSecurityGroups[0].VpcSecurityGroupId" --output text
+
+aws ec2 authorize-security-group-ingress --group-id <RDS_SG_ID> --protocol tcp --port 5432 --source-group sg-01457e1a4f626593f
+```
+
+### 6.3 Install database drivers (per service)
+Install SQLAlchemy and the PostgreSQL driver in each service's virtual environment, then freeze requirements.
 ```bash
-aws rds describe-db-instances \
-  --db-instance-identifier cw-event-db \
-  --query "DBInstances[0].VpcSecurityGroups[0].VpcSecurityGroupId" \
-  --output text
-```
- Restrict access 
-
- ```bash
-aws ec2 authorize-security-group-ingress \
-  --group-id <RDS_SECURITY_GROUP_ID_FROM_ABOVE> \
-  --protocol tcp \
-  --port 5432 \
-  --source-group sg-01457e1a4f626593f
-```
-This allows K3s EC2 instance can reach to RDS
-
-### Step 6.3 — Install DB Drivers in All 3 Microservices
-
-```bash
-cd ~/microservices/event-service
+cd ~/microservices/<service>
 source venv/bin/activate
 pip install sqlalchemy psycopg2-binary
-
-cd ~/microservices/program-service
-source venv/bin/activate
-pip install sqlalchemy psycopg2-binary
-
-cd ~/microservices/registration-service
-source venv/bin/activate
-pip install sqlalchemy psycopg2-binary
-```
-SQLAlchemy — Python's most widely-used ORM (Object-Relational Mapper). SQLAlchemy lets us define database tables as Python classes and interact with them using normal Python code — it translates that into SQL behind the scenes.
-
----
-
-For three Microservices
-```bash
-which pip
 pip freeze | grep -iE "fastapi|uvicorn|pydantic|sqlalchemy|psycopg2" > requirements.txt
-cat requirements.txt
-wc -l requirements.txt
 ```
 
-### Step 6.4 — SQLAlchemy Models & Database Connection
+### 6.4 Database connection module — database.py
+Identical connection pattern used across all three services, reading connection details from environment variables.
+```python
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+DB_USER = os.getenv("DB_USER", "cwadmin")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_HOST = os.getenv("DB_HOST", "")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "postgres")
+
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?sslmode=require"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+```
+
+### 6.5 SQLAlchemy models
+
+#### Event Service — models.py
+```python
+from sqlalchemy import Column, String, Float, Integer, DateTime
+from database import Base
+
+class EventDB(Base):
+    __tablename__ = "events"
+    event_id = Column(String, primary_key=True, index=True)
+    title = Column(String, nullable=False)
+    venue = Column(String, nullable=False)
+    date_time = Column(DateTime, nullable=False)
+    ticket_price = Column(Float, nullable=False)
+    capacity = Column(Integer, nullable=False)
+    seats_available = Column(Integer, nullable=False)
+```
+
+#### Program Service — models.py
+```python
+from sqlalchemy import Column, String
+from database import Base
+
+class SessionDB(Base):
+    __tablename__ = "sessions"
+    session_id = Column(String, primary_key=True, index=True)
+    day = Column(String, nullable=False)
+    track = Column(String, nullable=False)
+    session_name = Column(String, nullable=False)
+    speaker_name = Column(String, nullable=False)
+    start_time = Column(String, nullable=False)
+    end_time = Column(String, nullable=False)
+```
+
+#### Registration Service — models.py
+```python
+from sqlalchemy import Column, String, Integer, DateTime
+from database import Base
+
+class RegistrationDB(Base):
+    __tablename__ = "registrations"
+    registration_id = Column(String, primary_key=True, index=True)
+    event_id = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    email = Column(String, nullable=False)
+    ticket_count = Column(Integer, nullable=False)
+    timestamp = Column(DateTime, nullable=False)
+
+class EventDB(Base):
+    __tablename__ = "events"
+    event_id = Column(String, primary_key=True, index=True)
+    title = Column(String)
+    venue = Column(String)
+    date_time = Column(DateTime)
+    ticket_price = Column(Integer)
+    capacity = Column(Integer)
+    seats_available = Column(Integer)
+```
+
+### 6.6 Application logic — main.py
+
+#### Event Service
+```python
+from fastapi import FastAPI, HTTPException, Depends
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from datetime import datetime
+
+from database import engine, get_db, Base
+from models import EventDB
+
+Base.metadata.create_all(bind=engine)
+app = FastAPI(title="Event Service")
+
+class Event(BaseModel):
+    event_id: str
+    title: str
+    venue: str
+    date_time: datetime
+    ticket_price: float
+    capacity: int
+    seats_available: int
+    class Config:
+        from_attributes = True
+
+@app.get("/")
+def root():
+    return {"service": "Event Service", "status": "running"}
+
+@app.post("/events", response_model=Event)
+def create_event(event: Event, db: Session = Depends(get_db)):
+    existing = db.query(EventDB).filter(EventDB.event_id == event.event_id).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Event ID already exists")
+    db_event = EventDB(**event.dict())
+    db.add(db_event)
+    db.commit()
+    db.refresh(db_event)
+    return db_event
+
+@app.get("/events", response_model=list[Event])
+def list_events(db: Session = Depends(get_db)):
+    return db.query(EventDB).all()
+
+@app.get("/events/{event_id}", response_model=Event)
+def get_event(event_id: str, db: Session = Depends(get_db)):
+    event = db.query(EventDB).filter(EventDB.event_id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return event
+
+@app.put("/events/{event_id}", response_model=Event)
+def update_event(event_id: str, updated: Event, db: Session = Depends(get_db)):
+    event = db.query(EventDB).filter(EventDB.event_id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    for key, value in updated.dict().items():
+        setattr(event, key, value)
+    db.commit()
+    db.refresh(event)
+    return event
+
+@app.delete("/events/{event_id}")
+def delete_event(event_id: str, db: Session = Depends(get_db)):
+    event = db.query(EventDB).filter(EventDB.event_id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    db.delete(event)
+    db.commit()
+    return {"message": "Event deleted"}
+```
+
+#### Program Service
+```python
+from fastapi import FastAPI, HTTPException, Depends
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+
+from database import engine, get_db, Base
+from models import SessionDB
+
+Base.metadata.create_all(bind=engine)
+app = FastAPI(title="Program Service")
+
+class SessionModel(BaseModel):
+    session_id: str
+    day: str
+    track: str
+    session_name: str
+    speaker_name: str
+    start_time: str
+    end_time: str
+    class Config:
+        from_attributes = True
+
+@app.get("/")
+def root():
+    return {"service": "Program Service", "status": "running"}
+
+@app.post("/sessions", response_model=SessionModel)
+def create_session(session: SessionModel, db: Session = Depends(get_db)):
+    existing = db.query(SessionDB).filter(SessionDB.session_id == session.session_id).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Session ID already exists")
+    db_session = SessionDB(**session.dict())
+    db.add(db_session)
+    db.commit()
+    db.refresh(db_session)
+    return db_session
+
+@app.get("/sessions", response_model=list[SessionModel])
+def list_sessions(db: Session = Depends(get_db)):
+    return db.query(SessionDB).all()
+
+@app.get("/sessions/track/{track}", response_model=list[SessionModel])
+def get_sessions_by_track(track: str, db: Session = Depends(get_db)):
+    results = db.query(SessionDB).filter(SessionDB.track.ilike(track)).all()
+    if not results:
+        raise HTTPException(status_code=404, detail="No sessions found for this track")
+    return results
+
+@app.get("/sessions/{session_id}", response_model=SessionModel)
+def get_session(session_id: str, db: Session = Depends(get_db)):
+    session = db.query(SessionDB).filter(SessionDB.session_id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+@app.put("/sessions/{session_id}", response_model=SessionModel)
+def update_session(session_id: str, updated: SessionModel, db: Session = Depends(get_db)):
+    session = db.query(SessionDB).filter(SessionDB.session_id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    for key, value in updated.dict().items():
+        setattr(session, key, value)
+    db.commit()
+    db.refresh(session)
+    return session
+
+@app.delete("/sessions/{session_id}")
+def delete_session(session_id: str, db: Session = Depends(get_db)):
+    session = db.query(SessionDB).filter(SessionDB.session_id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    db.delete(session)
+    db.commit()
+    return {"message": "Session deleted"}
+```
+
+#### Registration Service
+```python
+from fastapi import FastAPI, HTTPException, Depends
+from sqlalchemy.orm import Session
+from pydantic import BaseModel, EmailStr
+from datetime import datetime
+import uuid
+
+from database import engine, get_db, Base
+from models import RegistrationDB, EventDB
+
+Base.metadata.create_all(bind=engine)
+app = FastAPI(title="Registration Service")
+LOW_SEATS_THRESHOLD = 10
+
+class RegistrationRequest(BaseModel):
+    event_id: str
+    name: str
+    email: EmailStr
+    ticket_count: int
+
+class Registration(RegistrationRequest):
+    registration_id: str
+    timestamp: datetime
+    class Config:
+        from_attributes = True
+
+@app.get("/")
+def root():
+    return {"service": "Registration Service", "status": "running"}
+
+@app.post("/registrations", response_model=Registration)
+def create_registration(reg: RegistrationRequest, db: Session = Depends(get_db)):
+    event = db.query(EventDB).filter(EventDB.event_id == reg.event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    if reg.ticket_count > event.seats_available:
+        raise HTTPException(status_code=400, detail="Not enough seats available")
+
+    event.seats_available -= reg.ticket_count
+
+    registration = RegistrationDB(
+        registration_id=str(uuid.uuid4()),
+        timestamp=datetime.utcnow(),
+        **reg.dict()
+    )
+    db.add(registration)
+    db.commit()
+    db.refresh(registration)
+    db.refresh(event)
+
+    if event.seats_available < LOW_SEATS_THRESHOLD:
+        trigger_low_seats_alert(event.event_id, event.seats_available)
+
+    return registration
+
+@app.get("/registrations", response_model=list[Registration])
+def list_registrations(db: Session = Depends(get_db)):
+    return db.query(RegistrationDB).all()
+
+@app.get("/registrations/{registration_id}", response_model=Registration)
+def get_registration(registration_id: str, db: Session = Depends(get_db)):
+    reg = db.query(RegistrationDB).filter(RegistrationDB.registration_id == registration_id).first()
+    if not reg:
+        raise HTTPException(status_code=404, detail="Registration not found")
+    return reg
+
+def trigger_low_seats_alert(event_id: str, seats_left: int):
+    print(f"[ALERT] Event {event_id} has only {seats_left} seats left - triggering notification.")
+```
+
+### 6.7 Run and verify persistence (per service, in tmux)
+Start each service in its own tmux session with the DB environment variables set, then verify it's running.
+```bash
+tmux new -s <service>
+cd ~/microservices/<service>
+export DB_USER=cwadmin
+export DB_PASSWORD='<password>'
+export DB_HOST=<rds-endpoint>
+export DB_PORT=5432
+export DB_NAME=postgres
+source venv/bin/activate
+uvicorn main:app --host 0.0.0.0 --port <port> --reload
+```
+Detach: `Ctrl+B`, then `D`
+```bash
+curl http://localhost:<port>/
+```
+
+### 6.8 Verify data directly in PostgreSQL
+Connect with psql and inspect the tables to confirm data is persisted.
+```bash
+psql "host=<rds-endpoint> port=5432 dbname=postgres user=cwadmin password=<password> sslmode=require"
+```
+```sql
+\dt
+SELECT * FROM events;
+SELECT * FROM sessions;
+SELECT * FROM registrations;
+```
 
 ```bash
 # From local WSL terminal
