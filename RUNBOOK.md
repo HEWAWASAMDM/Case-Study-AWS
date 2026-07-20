@@ -676,17 +676,88 @@ kubectl run test-curl --image=curlimages/curl -it --rm --restart=Never -- curl h
 kubectl run test-curl --image=curlimages/curl -it --rm --restart=Never -- curl http://registration-service:8003/
 ```
 **Expected:** each returns its health-check JSON, confirming Kubernetes' internal DNS-based service discovery works correctly (services reachable by name, not just by pod IP).
- 
+
+### Q3 - Saving Transactional Data 
+
+### Step 6.1 — Create the RDS Instance
+
+```bash
+aws rds create-db-instance \
+  --db-instance-identifier cw-event-db \
+  --db-instance-class db.t3.micro \
+  --engine postgres \
+  --engine-version 16.9 \
+  --master-username cwadmin \
+  --master-user-password 'ChangeThisPassword123!' \
+  --allocated-storage 20 \
+  --publicly-accessible \
+  --backup-retention-period 0
+```
+
+### Step 6.2 — Get the RDS Endpoint & Lock Down Access
+
+```bash
+aws rds describe-db-instances \
+  --db-instance-identifier cw-event-db \
+  --query "DBInstances[0].Endpoint.Address" \
+  --output text
+```
+ your microservices will use to connect — RDS doesn't use a fixed IP, it uses this DNS name, which AWS manages behind the scenes.
+
+ Get the RDS security group ID 
+```bash
+aws rds describe-db-instances \
+  --db-instance-identifier cw-event-db \
+  --query "DBInstances[0].VpcSecurityGroups[0].VpcSecurityGroupId" \
+  --output text
+```
+ Restrict access 
+
+ ```bash
+aws ec2 authorize-security-group-ingress \
+  --group-id <RDS_SECURITY_GROUP_ID_FROM_ABOVE> \
+  --protocol tcp \
+  --port 5432 \
+  --source-group sg-01457e1a4f626593f
+```
+This allows K3s EC2 instance can reach to RDS
+
+### Step 6.3 — Install DB Drivers in All 3 Microservices
+
+```bash
+cd ~/microservices/event-service
+source venv/bin/activate
+pip install sqlalchemy psycopg2-binary
+
+cd ~/microservices/program-service
+source venv/bin/activate
+pip install sqlalchemy psycopg2-binary
+
+cd ~/microservices/registration-service
+source venv/bin/activate
+pip install sqlalchemy psycopg2-binary
+```
+SQLAlchemy — Python's most widely-used ORM (Object-Relational Mapper). SQLAlchemy lets us define database tables as Python classes and interact with them using normal Python code — it translates that into SQL behind the scenes.
+
 ---
- 
+
+For three Microservices
+```bash
+which pip
+pip freeze | grep -iE "fastapi|uvicorn|pydantic|sqlalchemy|psycopg2" > requirements.txt
+cat requirements.txt
+wc -l requirements.txt
+```
+
+### Step 6.4 — SQLAlchemy Models & Database Connection
+
+```bash
+# From local WSL terminal
+aws rds describe-db-instances --db-instance-identifier cw-event-db --query "DBInstances[0].Endpoint.Address" --output text
+```
 
 > **TODO (future step):** Allocate an Elastic IP so the public IP stops changing —
 > planned before CI/CD stage / viva demo.
 
 ---
 
-## Change Log
-
-| Date | Change |
-|---|---|
-| 19 Jul 2026 | Initial runbook: account setup, k3s cluster, frontend deployed and verified |
