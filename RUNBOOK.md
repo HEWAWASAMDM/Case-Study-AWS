@@ -243,7 +243,7 @@ http://<PUBLIC_IP>:30080
 
 ---
 
-## Section 4 — Pausing Work (cost control)
+
 
 ### 4.1 Stop the instance when not in use (run on LOCAL machine)
 ```bash
