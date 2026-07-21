@@ -1,6 +1,6 @@
 (function () {
   // ---- CONFIG ----
-  const INGESTION_API = "http://<YOUR_INGESTION_SERVICE_URL>/events"; 
+  const INGESTION_API = "http://108.131.159.52:30081/events"; 
   // ^ placeholder for now — will become the K8s service URL after Step 8.5
 
   // ---- SESSION ID ----
