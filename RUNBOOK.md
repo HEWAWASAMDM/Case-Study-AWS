@@ -1282,7 +1282,300 @@ def create_registration(reg: RegistrationRequest, db: Session = Depends(get_db))
     db.commit()
     db.refresh(registration)
     db.refresh(event)
+# Step 8 — Web Analytics → ClickHouse
 
+**Status:** In progress (8.1–8.5 complete and verified; 8.6 end-to-end data flow pending final confirmation)
+
+---
+
+## 8.1 — Deploy ClickHouse to k3s
+
+SSH into the EC2 instance:
+```bash
+ssh -i cw-k8s-key.pem ubuntu@<PUBLIC_IP>
+```
+
+Create the manifests folder:
+```bash
+mkdir -p ~/k8s-manifests
+cd ~/k8s-manifests
+```
+
+Write the ClickHouse Deployment (with persistent storage — see note below):
+```bash
+cat > clickhouse-deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: clickhouse
+  template:
+    metadata:
+      labels:
+        app: clickhouse
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:24.8
+          ports:
+            - containerPort: 8123
+              name: http
+            - containerPort: 9000
+              name: native
+          env:
+            - name: CLICKHOUSE_DB
+              value: "analytics"
+            - name: CLICKHOUSE_USER
+              value: "cwadmin"
+            - name: CLICKHOUSE_PASSWORD
+              value: "clickhouse123!"
+            - name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+              value: "1"
+          volumeMounts:
+            - name: clickhouse-storage
+              mountPath: /var/lib/clickhouse
+      volumes:
+        - name: clickhouse-storage
+          persistentVolumeClaim:
+            claimName: clickhouse-pvc
+EOF
+```
+
+Write the ClickHouse Service (internal only):
+```bash
+cat > clickhouse-service.yaml << 'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+spec:
+  type: ClusterIP
+  selector:
+    app: clickhouse
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+    - name: native
+      port: 9000
+      targetPort: 9000
+EOF
+```
+
+Create the PersistentVolumeClaim so ClickHouse's data survives pod restarts:
+```bash
+cat > clickhouse-pvc.yaml << 'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: clickhouse-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+EOF
+
+kubectl apply -f clickhouse-pvc.yaml
+```
+
+Apply the Deployment and Service:
+```bash
+kubectl apply -f clickhouse-deployment.yaml
+kubectl apply -f clickhouse-service.yaml
+```
+
+Verify:
+```bash
+kubectl get pods -l app=clickhouse
+kubectl get pvc
+```
+**Expected:** `1/1 Running` pod; PVC status `Bound`.
+
+**Why a PVC:** Kubernetes pods have disposable local storage by design — a pod recreated after eviction, restart, or upgrade starts with an empty filesystem. Since ClickHouse writes its data files to local disk (`/var/lib/clickhouse`), the PVC is what makes that data durable across pod recreation events.
+
+---
+
+## 8.2 — Create the analytics events table
+
+```bash
+kubectl run clickhouse-client --image=curlimages/curl -it --rm --restart=Never -- \
+  curl -u cwadmin:clickhouse123! "http://clickhouse:8123/" --data-binary "
+CREATE TABLE analytics.web_events (
+    event_id UUID DEFAULT generateUUIDv4(),
+    event_type String,
+    session_id String,
+    page_url String,
+    section_name String,
+    time_spent_seconds Float32,
+    track_name String,
+    referrer String,
+    device_type String,
+    event_timestamp DateTime DEFAULT now()
+) ENGINE = MergeTree()
+ORDER BY event_timestamp"
+```
+
+Verify:
+```bash
+kubectl run clickhouse-client --image=curlimages/curl -it --rm --restart=Never -- \
+  curl -u cwadmin:clickhouse123! "http://clickhouse:8123/" --data-binary "SHOW TABLES FROM analytics"
+```
+**Expected:** `web_events` returned.
+
+**Persistence check:** deleting the ClickHouse pod and re-running `SHOW TABLES` after the replacement pod reaches `Running` confirmed `web_events` still exists — validating the PVC is functioning correctly.
+
+---
+
+## 8.3 — Ingestion API (4th microservice: `analytics-service`)
+
+FastAPI service exposing `POST /events`, writing rows into `analytics.web_events`. Built following the same pattern as `event-service` / `program-service` / `registration-service` (own `venv`, own `requirements.txt`, own `Dockerfile`).
+
+**Note on environment variable naming:** avoid env var names that collide with any Kubernetes Service name in the namespace (e.g. `CLICKHOUSE_PORT` collides with the auto-injected `<SERVICE>_PORT` variable Kubernetes generates for a Service named `clickhouse`). Use a distinct name such as `CH_PORT` instead.
+
+---
+
+## 8.4 — Frontend tracking script (`analytics-tracker.js`)
+
+Added to `templatemo_486_new_event/js/analytics-tracker.js`, referenced before `</body>`:
+```html
+<script src="js/custom.js"></script>
+<script src="js/analytics-tracker.js"></script>
+```
+
+Captures four metrics via `navigator.sendBeacon` (with `fetch(..., keepalive: true)` fallback):
+
+| Metric | `event_type` | Trigger |
+|---|---|---|
+| Page view | `page_view` | Fires once on page `load` |
+| Section engagement time | `section_view` | `IntersectionObserver` on each `<section id="...">`, threshold 0.4, fires once a section leaves view after >1s dwell |
+| Program track interest | `track_click` | Click on `#program .nav-tabs a[data-toggle="tab"]` |
+| Registration intent | `register_click` | Click on `#register form input[type="submit"]` |
+
+Each event also carries a session ID (persisted per-tab via `sessionStorage`), `page_url`, `referrer`, and `device_type` (derived from `navigator.userAgent`).
+
+---
+
+## 8.5 — Deploy ingestion API + rebuild frontend with tracking code
+
+### 8.5.1–8.5.2 — Build and import the ingestion API image
+```bash
+cd ~/microservices/analytics-service
+docker build -t analytics-service:v1 .
+docker save analytics-service:v1 | sudo k3s ctr -n k8s.io images import -
+sudo k3s crictl images | grep analytics-service
+```
+
+**Why `-n k8s.io` explicitly:** `docker save | k3s ctr images import` without a namespace flag imports into containerd's default namespace, which is *not* the namespace the kubelet/CRI reads from (`k8s.io`). Specifying `-n k8s.io` ensures the image is visible to Kubernetes when using `imagePullPolicy: Never`.
+
+### 8.5.3 — Deploy analytics-service to k8s
+```bash
+cd ~/k8s-manifests
+
+cat > analytics-service-deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: analytics-service
+  template:
+    metadata:
+      labels:
+        app: analytics-service
+    spec:
+      containers:
+        - name: analytics-service
+          image: analytics-service:v1
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8004
+EOF
+
+cat > analytics-service-svc.yaml << 'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: analytics-service
+spec:
+  type: NodePort
+  selector:
+    app: analytics-service
+  ports:
+    - port: 8004
+      targetPort: 8004
+      nodePort: 30081
+EOF
+
+kubectl apply -f analytics-service-deployment.yaml
+kubectl apply -f analytics-service-svc.yaml
+```
+
+Open the NodePort in the security group:
+```bash
+SG_ID=sg-01457e1a4f626593f
+aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 30081 --cidr 0.0.0.0/0
+```
+
+Verify:
+```bash
+kubectl get pods -l app=analytics-service
+kubectl get svc analytics-service
+curl http://localhost:30081/
+```
+**Expected:** `2/2 Running`; `{"service":"Analytics Ingestion Service","status":"running"}`.
+
+**Why NodePort here specifically:** unlike the internal-only `event-service` / `program-service` / `registration-service` (`ClusterIP`), the ingestion API must be reachable directly from a visitor's browser outside the cluster, so it requires a NodePort exposing it on the EC2 host.
+
+### 8.5.4 — Point the tracker at the real ingestion URL and rebuild the frontend
+```bash
+cd ~/new-event/templatemo_486_new_event
+# In js/analytics-tracker.js, set:
+# const INGESTION_API = "http://<PUBLIC_IP>:30081/events";
+
+docker build -t new-event-frontend:v2 .
+docker save new-event-frontend:v2 | sudo k3s ctr -n k8s.io images import -
+kubectl set image deployment/frontend-deployment frontend=new-event-frontend:v2
+kubectl rollout status deployment/frontend-deployment
+```
+
+Verify:
+```bash
+kubectl get pods -l app=frontend
+```
+**Expected:** `2/2 Running` on the new image.
+
+**Why the public IP is hardcoded:** the tracker script executes in the visitor's browser, outside the cluster's internal DNS. It can only reach the ingestion API via a routable address (the EC2 public IP), not the internal Kubernetes service name. Noted limitation: without an Elastic IP, this address changes on every instance stop/start and the frontend must be rebuilt accordingly.
+
+---
+
+## 8.6 — Verify events land in ClickHouse (in progress)
+
+```bash
+kubectl run clickhouse-client --image=curlimages/curl -it --rm --restart=Never -- \
+  curl -u cwadmin:clickhouse123! "http://clickhouse:8123/" --data-binary \
+  "SELECT event_type, count(*) FROM analytics.web_events GROUP BY event_type"
+```
+
+**Status:** table and persistence confirmed working; end-to-end browser → ingestion API → ClickHouse insert flow not yet confirmed with data. Final confirmation pending.
+
+---
+
+## Current Cluster State (10 pods across 5 deployments)
+- `frontend-deployment` — 2 replicas
+- `event-service` — 2 replicas
+- `program-service` — 2 replicas
+- `registration-service` — 2 replicas
+- `analytics-service` — 2 replicas
+- `clickhouse` — 1 replica (with PVC-backed persistent storage)
 ```
 Verify the change and restart
 ```bash
