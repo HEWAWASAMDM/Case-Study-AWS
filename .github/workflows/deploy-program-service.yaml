@@ -1,0 +1,114 @@
+name: Deploy Program Service Blue-Green
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'microservices/program-service/**'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  SERVICE_NAME: program-service
+
+jobs:
+  build-and-deploy:
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Log in to GHCR
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_TOKEN }}
+
+    - name: Build and push Docker image
+      run: |
+        cd microservices/program-service
+        docker build -t ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:${{ github.sha }} .
+        docker tag ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:latest
+        docker push ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:${{ github.sha }}
+        docker push ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:latest
+        docker rmi ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:latest
+
+    - name: Blue-Green Deployment
+      run: |
+        CURRENT=$(kubectl get deployment program-service -o jsonpath='{.metadata.labels.color}' 2>/dev/null || echo "blue")
+        [ "$CURRENT" == "blue" ] && IDLE="green" || IDLE="blue"
+        
+        cat << EOF > /tmp/program-service-${IDLE}.yaml
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: program-service-${IDLE}
+          labels:
+            app: program-service
+            color: ${IDLE}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: program-service
+              color: ${IDLE}
+          template:
+            metadata:
+              labels:
+                app: program-service
+                color: ${IDLE}
+            spec:
+              containers:
+              - name: program-service
+                image: ${{ env.REGISTRY }}/hewawasamdm/program-service:${{ github.sha }}
+                ports:
+                - containerPort: 8080
+                env:
+                - name: DB_HOST
+                  value: "cw-event-db.cpua0oyyqtqw.eu-west-1.rds.amazonaws.com"
+                - name: DB_PORT
+                  value: "5432"
+                - name: DB_NAME
+                  value: "postgres"
+                - name: DB_USER
+                  value: "cwadmin"
+                - name: DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: db-credentials
+                      key: password
+                resources:
+                  requests:
+                    memory: "64Mi"
+                    cpu: "50m"
+                  limits:
+                    memory: "128Mi"
+                    cpu: "100m"
+                readinessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: 8080
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+        EOF
+        
+        kubectl apply -f /tmp/program-service-${IDLE}.yaml
+        kubectl rollout status deployment/program-service-${IDLE} --timeout=120s
+        
+        POD_IP=$(kubectl get pods -l app=program-service,color=${IDLE} -o jsonpath='{.items[0].status.podIP}')
+        for i in {1..10}; do
+          if curl -s http://${POD_IP}:8080/healthz | grep -q "healthy"; then
+            kubectl patch service program-service -p "{\"spec\":{\"selector\":{\"app\":\"program-service\",\"color\":\"${IDLE}\"}}}" 2>/dev/null || \
+            kubectl expose deployment program-service-${IDLE} --name=program-service --port=80 --target-port=8080
+            kubectl scale deployment program-service-${CURRENT} --replicas=0 2>/dev/null
+            echo "Deployed successfully to $IDLE"
+            exit 0
+          fi
+          sleep 5
+        done
+        exit 1

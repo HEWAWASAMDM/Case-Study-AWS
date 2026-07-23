@@ -1,0 +1,48 @@
+name: Deploy All Services Blue-Green
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Service to deploy (leave empty for all)'
+        required: false
+        default: 'all'
+
+jobs:
+  deploy-event:
+    if: ${{ github.event.inputs.service == 'all' || github.event.inputs.service == 'event' }}
+    uses: ./.github/workflows/deploy-event-service.yaml
+    secrets: inherit
+
+  deploy-program:
+    if: ${{ github.event.inputs.service == 'all' || github.event.inputs.service == 'program' }}
+    uses: ./.github/workflows/deploy-program-service.yaml
+    secrets: inherit
+
+  deploy-registration:
+    if: ${{ github.event.inputs.service == 'all' || github.event.inputs.service == 'registration' }}
+    uses: ./.github/workflows/deploy-registration-service.yaml
+    secrets: inherit
+
+  deploy-frontend:
+    if: ${{ github.event.inputs.service == 'all' || github.event.inputs.service == 'frontend' }}
+    uses: ./.github/workflows/deploy-frontend.yaml
+    secrets: inherit
+
+  verify-all:
+    needs: [deploy-event, deploy-program, deploy-registration, deploy-frontend]
+    if: always()
+    runs-on: self-hosted
+    steps:
+    - name: Final verification
+      run: |
+        echo "Deployment Status:"
+        kubectl get deployments
+        echo ""
+        echo "Services:"
+        kubectl get services
+        echo ""
+        echo "Pods:"
+        kubectl get pods

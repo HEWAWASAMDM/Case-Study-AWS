@@ -1,0 +1,148 @@
+name: Deploy Event Service Blue-Green
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'microservices/event-service/**'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  SERVICE_NAME: event-service
+
+jobs:
+  build-and-deploy:
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Log in to GHCR
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_TOKEN }}
+
+    - name: Build and push Docker image
+      run: |
+        cd microservices/event-service
+        docker build -t ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:${{ github.sha }} .
+        docker tag ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:latest
+        docker push ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:${{ github.sha }}
+        docker push ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:latest
+        docker rmi ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/hewawasamdm/${{ env.SERVICE_NAME }}:latest
+
+    - name: Determine current color
+      id: colors
+      run: |
+        CURRENT=$(kubectl get deployment event-service -o jsonpath='{.metadata.labels.color}' 2>/dev/null || echo "blue")
+        if [ "$CURRENT" == "blue" ]; then
+          echo "idle=green" >> $GITHUB_OUTPUT
+          echo "current=blue" >> $GITHUB_OUTPUT
+        else
+          echo "idle=blue" >> $GITHUB_OUTPUT
+          echo "current=green" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Deploy to idle environment
+      run: |
+        IDLE_COLOR="${{ steps.colors.outputs.idle }}"
+        
+        cat << DEPLOYMENT_EOF > /tmp/event-service-${IDLE_COLOR}.yaml
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: event-service-${IDLE_COLOR}
+          labels:
+            app: event-service
+            color: ${IDLE_COLOR}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: event-service
+              color: ${IDLE_COLOR}
+          template:
+            metadata:
+              labels:
+                app: event-service
+                color: ${IDLE_COLOR}
+            spec:
+              containers:
+              - name: event-service
+                image: ${{ env.REGISTRY }}/hewawasamdm/event-service:${{ github.sha }}
+                ports:
+                - containerPort: 8080
+                env:
+                - name: DB_HOST
+                  value: "cw-event-db.cpua0oyyqtqw.eu-west-1.rds.amazonaws.com"
+                - name: DB_PORT
+                  value: "5432"
+                - name: DB_NAME
+                  value: "postgres"
+                - name: DB_USER
+                  value: "cwadmin"
+                - name: DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: db-credentials
+                      key: password
+                resources:
+                  requests:
+                    memory: "64Mi"
+                    cpu: "50m"
+                  limits:
+                    memory: "128Mi"
+                    cpu: "100m"
+                readinessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: 8080
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+        DEPLOYMENT_EOF
+        
+        kubectl apply -f /tmp/event-service-${IDLE_COLOR}.yaml
+        kubectl rollout status deployment/event-service-${IDLE_COLOR} --timeout=120s
+
+    - name: Health check
+      run: |
+        IDLE_COLOR="${{ steps.colors.outputs.idle }}"
+        POD_NAME=$(kubectl get pods -l app=event-service,color=${IDLE_COLOR} -o jsonpath='{.items[0].metadata.name}')
+        POD_IP=$(kubectl get pod $POD_NAME -o jsonpath='{.status.podIP}')
+        
+        for i in {1..10}; do
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://${POD_IP}:8080/healthz)
+          if [ "$STATUS" == "200" ]; then
+            echo "Health check passed"
+            exit 0
+          fi
+          echo "Attempt $i: Waiting... (Status: $STATUS)"
+          sleep 5
+        done
+        echo "Health check failed"
+        exit 1
+
+    - name: Switch traffic
+      run: |
+        IDLE_COLOR="${{ steps.colors.outputs.idle }}"
+        
+        if kubectl get service event-service &>/dev/null; then
+          kubectl patch service event-service -p "{\"spec\":{\"selector\":{\"app\":\"event-service\",\"color\":\"$IDLE_COLOR\"}}}"
+        else
+          kubectl expose deployment event-service-${IDLE_COLOR} --name=event-service --port=80 --target-port=8080 --type=ClusterIP
+        fi
+        
+        echo "Traffic switched to $IDLE_COLOR"
+        
+        # Remove old deployment to save resources
+        CURRENT_COLOR="${{ steps.colors.outputs.current }}"
+        if [ "$CURRENT_COLOR" != "none" ]; then
+          kubectl scale deployment event-service-${CURRENT_COLOR} --replicas=0
+        fi
