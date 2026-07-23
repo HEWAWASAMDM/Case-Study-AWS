@@ -6,6 +6,7 @@ on:
     paths:
       - 'microservices/program-service/**'
   workflow_dispatch:
+  workflow_call:
 
 env:
   REGISTRY: ghcr.io

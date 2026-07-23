@@ -6,6 +6,7 @@ on:
     paths:
       - 'microservices/event-service/**'
   workflow_dispatch:
+  workflow_call:
 
 env:
   REGISTRY: ghcr.io
@@ -141,7 +142,6 @@ jobs:
         
         echo "Traffic switched to $IDLE_COLOR"
         
-        # Remove old deployment to save resources
         CURRENT_COLOR="${{ steps.colors.outputs.current }}"
         if [ "$CURRENT_COLOR" != "none" ]; then
           kubectl scale deployment event-service-${CURRENT_COLOR} --replicas=0
