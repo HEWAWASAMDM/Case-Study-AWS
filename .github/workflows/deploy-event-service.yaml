@@ -38,7 +38,7 @@ jobs:
     - name: Determine current color
       id: colors
       run: |
-        CURRENT=$(kubectl get deployment event-service -o jsonpath='{.metadata.labels.color}' 2>/dev/null || echo "blue")
+        CURRENT=$(kubectl get service event-service -o jsonpath='{.spec.selector.color}' 2>/dev/null || echo "blue")
         if [ "$CURRENT" == "blue" ]; then
           echo "idle=green" >> $GITHUB_OUTPUT
           echo "current=blue" >> $GITHUB_OUTPUT
@@ -74,7 +74,7 @@ jobs:
               - name: event-service
                 image: ${{ env.REGISTRY }}/hewawasamdm/event-service:${{ github.sha }}
                 ports:
-                - containerPort: 8080
+                - containerPort: 8001
                 env:
                 - name: DB_HOST
                   value: "cw-event-db.cpua0oyyqtqw.eu-west-1.rds.amazonaws.com"
@@ -99,7 +99,7 @@ jobs:
                 readinessProbe:
                   httpGet:
                     path: /healthz
-                    port: 8080
+                    port: 8001
                   initialDelaySeconds: 10
                   periodSeconds: 5
         DEPLOYMENT_EOF
@@ -109,15 +109,12 @@ jobs:
     - name: Health check
       run: |
         IDLE_COLOR="${{ steps.colors.outputs.idle }}"
-        POD_NAME=$(kubectl get pods -l app=event-service,color=${IDLE_COLOR} -o jsonpath='{.items[0].metadata.name}')
-        POD_IP=$(kubectl get pod $POD_NAME -o jsonpath='{.status.podIP}')
+        POD_IP=$(kubectl get pods -l app=event-service,color=${IDLE_COLOR} -o jsonpath='{.items[0].status.podIP}')
         for i in {1..10}; do
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://${POD_IP}:8080/healthz)
-          if [ "$STATUS" == "200" ]; then
+          if curl -s http://${POD_IP}:8001/healthz | grep -q "healthy"; then
             echo "Health check passed"
             exit 0
           fi
-          echo "Attempt $i: Waiting..."
           sleep 5
         done
         echo "Health check failed"
@@ -126,13 +123,7 @@ jobs:
     - name: Switch traffic
       run: |
         IDLE_COLOR="${{ steps.colors.outputs.idle }}"
-        if kubectl get service event-service &>/dev/null; then
-          kubectl patch service event-service -p "{\"spec\":{\"selector\":{\"app\":\"event-service\",\"color\":\"$IDLE_COLOR\"}}}"
-        else
-          kubectl expose deployment event-service-${IDLE_COLOR} --name=event-service --port=80 --target-port=8080 --type=ClusterIP
-        fi
-        echo "Traffic switched to $IDLE_COLOR"
         CURRENT_COLOR="${{ steps.colors.outputs.current }}"
-        if [ "$CURRENT_COLOR" != "none" ]; then
-          kubectl scale deployment event-service-${CURRENT_COLOR} --replicas=0
-        fi
+        kubectl patch service event-service -p "{\"spec\":{\"selector\":{\"app\":\"event-service\",\"color\":\"$IDLE_COLOR\"}}}"
+        echo "Traffic switched to $IDLE_COLOR"
+        kubectl scale deployment event-service-${CURRENT_COLOR} --replicas=0 2>/dev/null || true
