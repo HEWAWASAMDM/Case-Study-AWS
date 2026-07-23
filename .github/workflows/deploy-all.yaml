@@ -6,9 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       service:
-        description: 'Service to deploy (leave empty for all)'
+        description: 'Service to deploy'
         required: false
         default: 'all'
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   deploy-event:

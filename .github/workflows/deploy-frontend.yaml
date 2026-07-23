@@ -15,10 +15,6 @@ env:
 jobs:
   build-and-deploy:
     runs-on: self-hosted
-    permissions:
-      contents: read
-      packages: write
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -43,7 +39,6 @@ jobs:
       run: |
         CURRENT=$(kubectl get deployment frontend-deployment -o jsonpath='{.metadata.labels.color}' 2>/dev/null || echo "blue")
         [ "$CURRENT" == "blue" ] && IDLE="green" || IDLE="blue"
-        
         cat << EOF > /tmp/frontend-${IDLE}.yaml
         apiVersion: apps/v1
         kind: Deployment
@@ -83,13 +78,9 @@ jobs:
                   initialDelaySeconds: 5
                   periodSeconds: 5
         EOF
-        
         kubectl apply -f /tmp/frontend-${IDLE}.yaml
         kubectl rollout status deployment/frontend-${IDLE} --timeout=120s
-        
         sleep 10
         kubectl patch service frontend-service -p "{\"spec\":{\"selector\":{\"app\":\"frontend\",\"color\":\"${IDLE}\"}}}" 2>/dev/null || \
         kubectl expose deployment frontend-${IDLE} --name=frontend-service --port=80 --target-port=80 --type=LoadBalancer
-        
         kubectl scale deployment frontend-${CURRENT} --replicas=0 2>/dev/null
-        echo "Frontend deployed to $IDLE"

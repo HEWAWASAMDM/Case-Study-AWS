@@ -15,10 +15,6 @@ env:
 jobs:
   build-and-deploy:
     runs-on: self-hosted
-    permissions:
-      contents: read
-      packages: write
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -43,7 +39,6 @@ jobs:
       run: |
         CURRENT=$(kubectl get deployment registration-service -o jsonpath='{.metadata.labels.color}' 2>/dev/null || echo "blue")
         [ "$CURRENT" == "blue" ] && IDLE="green" || IDLE="blue"
-        
         cat << EOF > /tmp/registration-service-${IDLE}.yaml
         apiVersion: apps/v1
         kind: Deployment
@@ -97,13 +92,9 @@ jobs:
                   initialDelaySeconds: 10
                   periodSeconds: 5
         EOF
-        
         kubectl apply -f /tmp/registration-service-${IDLE}.yaml
         kubectl rollout status deployment/registration-service-${IDLE} --timeout=120s
-        
         sleep 10
         kubectl patch service registration-service -p "{\"spec\":{\"selector\":{\"app\":\"registration-service\",\"color\":\"${IDLE}\"}}}" 2>/dev/null || \
         kubectl expose deployment registration-service-${IDLE} --name=registration-service --port=80 --target-port=8080
-        
         kubectl scale deployment registration-service-${CURRENT} --replicas=0 2>/dev/null
-        echo "Registration service deployed to $IDLE"

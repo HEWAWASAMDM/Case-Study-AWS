@@ -15,10 +15,6 @@ env:
 jobs:
   build-and-deploy:
     runs-on: self-hosted
-    permissions:
-      contents: read
-      packages: write
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -54,7 +50,6 @@ jobs:
     - name: Deploy to idle environment
       run: |
         IDLE_COLOR="${{ steps.colors.outputs.idle }}"
-        
         cat << DEPLOYMENT_EOF > /tmp/event-service-${IDLE_COLOR}.yaml
         apiVersion: apps/v1
         kind: Deployment
@@ -108,7 +103,6 @@ jobs:
                   initialDelaySeconds: 10
                   periodSeconds: 5
         DEPLOYMENT_EOF
-        
         kubectl apply -f /tmp/event-service-${IDLE_COLOR}.yaml
         kubectl rollout status deployment/event-service-${IDLE_COLOR} --timeout=120s
 
@@ -117,14 +111,13 @@ jobs:
         IDLE_COLOR="${{ steps.colors.outputs.idle }}"
         POD_NAME=$(kubectl get pods -l app=event-service,color=${IDLE_COLOR} -o jsonpath='{.items[0].metadata.name}')
         POD_IP=$(kubectl get pod $POD_NAME -o jsonpath='{.status.podIP}')
-        
         for i in {1..10}; do
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://${POD_IP}:8080/healthz)
           if [ "$STATUS" == "200" ]; then
             echo "Health check passed"
             exit 0
           fi
-          echo "Attempt $i: Waiting... (Status: $STATUS)"
+          echo "Attempt $i: Waiting..."
           sleep 5
         done
         echo "Health check failed"
@@ -133,15 +126,12 @@ jobs:
     - name: Switch traffic
       run: |
         IDLE_COLOR="${{ steps.colors.outputs.idle }}"
-        
         if kubectl get service event-service &>/dev/null; then
           kubectl patch service event-service -p "{\"spec\":{\"selector\":{\"app\":\"event-service\",\"color\":\"$IDLE_COLOR\"}}}"
         else
           kubectl expose deployment event-service-${IDLE_COLOR} --name=event-service --port=80 --target-port=8080 --type=ClusterIP
         fi
-        
         echo "Traffic switched to $IDLE_COLOR"
-        
         CURRENT_COLOR="${{ steps.colors.outputs.current }}"
         if [ "$CURRENT_COLOR" != "none" ]; then
           kubectl scale deployment event-service-${CURRENT_COLOR} --replicas=0

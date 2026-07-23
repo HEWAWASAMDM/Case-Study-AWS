@@ -15,10 +15,6 @@ env:
 jobs:
   build-and-deploy:
     runs-on: self-hosted
-    permissions:
-      contents: read
-      packages: write
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -43,7 +39,6 @@ jobs:
       run: |
         CURRENT=$(kubectl get deployment program-service -o jsonpath='{.metadata.labels.color}' 2>/dev/null || echo "blue")
         [ "$CURRENT" == "blue" ] && IDLE="green" || IDLE="blue"
-        
         cat << EOF > /tmp/program-service-${IDLE}.yaml
         apiVersion: apps/v1
         kind: Deployment
@@ -97,17 +92,14 @@ jobs:
                   initialDelaySeconds: 10
                   periodSeconds: 5
         EOF
-        
         kubectl apply -f /tmp/program-service-${IDLE}.yaml
         kubectl rollout status deployment/program-service-${IDLE} --timeout=120s
-        
         POD_IP=$(kubectl get pods -l app=program-service,color=${IDLE} -o jsonpath='{.items[0].status.podIP}')
         for i in {1..10}; do
           if curl -s http://${POD_IP}:8080/healthz | grep -q "healthy"; then
             kubectl patch service program-service -p "{\"spec\":{\"selector\":{\"app\":\"program-service\",\"color\":\"${IDLE}\"}}}" 2>/dev/null || \
             kubectl expose deployment program-service-${IDLE} --name=program-service --port=80 --target-port=8080
             kubectl scale deployment program-service-${CURRENT} --replicas=0 2>/dev/null
-            echo "Deployed successfully to $IDLE"
             exit 0
           fi
           sleep 5
