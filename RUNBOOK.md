@@ -1581,5 +1581,298 @@ Verify the change and restart
 ```bash
 grep -n "boto3\|lambda_client\|InvocationType" main.py
 ```
+
+**Step 9: Metabase | Step 10: Prometheus + Grafana**
+**Author:** Dinithi Hewawasam
+ 
+---
+ 
+## Step 9 — Business Intelligence Dashboard (Metabase)
+ 
+**Status:** Complete
+ 
+### 9.1 Pre-flight check
+ 
+Before deploying Metabase, node headroom was confirmed. Metabase is a JVM-based application with a materially higher baseline memory footprint than the project's FastAPI microservices, and deploying it without checking available capacity was the direct cause of an earlier memory-eviction incident on the `t3.small` node.
+ 
+```bash
+kubectl top nodes
+kubectl get pods -A
+```
+ 
+**Why we used this code:** `kubectl top nodes` surfaces current CPU/memory pressure before adding a new, heavier workload. Treating this as a mandatory gate — rather than deploying first and reacting to problems afterwards — avoids repeating the same eviction behaviour seen previously in the project.
+ 
+### 9.2 Create Metabase's own metadata database on RDS
+ 
+```bash
+psql "host=<rds-endpoint> port=5432 dbname=postgres user=cwadmin password=<password> sslmode=require" \
+  -c "CREATE DATABASE metabase;"
+```
+ 
+**Why we used this code:** Metabase's *application* metadata (dashboards, users, saved queries) is kept in a separate database from the *business* data it visualises (`events`, `sessions`, `registrations`). Mixing the two would risk Metabase's internal schema colliding with, or cluttering, the application's own tables.
+ 
+### 9.2 Write the Metabase manifests
+ 
+```bash
+mkdir -p ~/k8s-manifests
+cd ~/k8s-manifests
+```
+ 
+**Deployment:**
+```bash
+cat > metabase-deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metabase
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: metabase
+  template:
+    metadata:
+      labels:
+        app: metabase
+    spec:
+      containers:
+        - name: metabase
+          image: metabase/metabase:v0.50.8
+          ports:
+            - containerPort: 3000
+          env:
+            - name: MB_DB_TYPE
+              value: "postgres"
+            - name: MB_DB_DBNAME
+              value: "metabase"
+            - name: MB_DB_PORT
+              value: "5432"
+            - name: MB_DB_USER
+              value: "cwadmin"
+            - name: MB_DB_PASS
+              value: "<password>"
+            - name: MB_DB_HOST
+              value: "<rds-endpoint>"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+EOF
+```
+ 
+**Why we used this code:** explicit `resources.requests` and `resources.limits` are set deliberately here, unlike the lighter FastAPI services. Without a memory limit, a JVM-based application like Metabase can consume unbounded memory under load and trigger the same node-level eviction seen earlier — `requests` reserves guaranteed headroom on the node at scheduling time, while `limits` caps worst-case consumption so one pod cannot starve the rest of the cluster.
+ 
+**Service:**
+```bash
+cat > metabase-service.yaml << 'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: metabase
+spec:
+  type: NodePort
+  selector:
+    app: metabase
+  ports:
+    - port: 3000
+      targetPort: 3000
+      nodePort: 30082
+EOF
+```
+ 
+**Why we used this code:** `NodePort` (rather than `ClusterIP`, used for the internal-only microservices) is required because Metabase's dashboard UI must be reachable directly from a browser outside the cluster, in the same way the frontend and analytics-ingestion services are exposed.
+ 
+### 9.3 Apply and verify
+ 
+```bash
+kubectl apply -f metabase-deployment.yaml
+kubectl apply -f metabase-service.yaml
+ 
+# Open the NodePort in the security group
+SG_ID=sg-01457e1a4f626593f
+aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 30082 --cidr 0.0.0.0/0
+ 
+kubectl get pods -l app=metabase
+kubectl get svc metabase
+```
+ 
+**Expected:** `1/1 Running`; service listed as `3000:30082/TCP`.
+ 
+### 9.4 Connect Metabase to the application data
+ 
+Accessed via:
+```
+http://<PUBLIC_IP>:30082
+```
+ 
+Completed Metabase's first-run setup wizard, then added the existing RDS PostgreSQL instance (`events`, `sessions`, `registrations` tables) as a connected data source, enabling BI reporting directly on top of the application's transactional data without duplicating it.
+ 
+**Why we used this approach:** connecting Metabase directly to the existing RDS instance (using a distinct database within the same instance for its own metadata) avoids standing up a second database server purely for BI purposes, keeping the architecture consistent with the rest of the project's data layer.
+ 
+---
+ 
+## Step 10 — Kubernetes Cluster Monitoring (Prometheus + Grafana)
+ 
+**Status:** Complete (10.1–10.5 verified with dashboard evidence)
+ 
+### 10.1 Pre-flight check
+ 
+The same discipline applied in Step 9 was repeated here: cluster headroom was confirmed before adding the monitoring stack on top of an already-active cluster.
+ 
+```bash
+kubectl top nodes
+kubectl get pods -A
+```
+ 
+### 10.2 Deploy Prometheus + Grafana
+ 
+Prometheus and Grafana were deployed as the monitoring stack — the industry-standard pairing for Kubernetes observability, satisfying the coursework requirement to monitor system health, performance, and availability.
+ 
+**Why we used this code:** Prometheus scrapes and stores time-series metrics from cluster components; Grafana visualises those metrics as dashboards. Using this established pairing, rather than a custom-built solution, reflects standard industry practice for cloud-native observability.
+ 
+### 10.3 Configure Prometheus scraping
+ 
+Two scrape jobs were defined in the `prometheus-config` ConfigMap:
+ 
+```yaml
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: kubernetes_namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: kubernetes_pod_name
+ 
+  - job_name: 'kubernetes-cadvisor'
+    kubernetes_sd_configs:
+      - role: node
+    scheme: https
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      insecure_skip_verify: true
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    relabel_configs:
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        regex: (.+)
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+```
+ 
+**Why we used this code:** the `kubernetes-cadvisor` job (role: `node`) collects container-level CPU/memory metrics directly from each node's cAdvisor endpoint. The `kubernetes-pods` job (role: `pod`) is opt-in by design — only pods explicitly annotated `prometheus.io/scrape: "true"` are scraped, preventing Prometheus from indiscriminately hitting every pod in the cluster.
+ 
+#### Troubleshooting — cAdvisor scrape failure (`up=0`)
+ 
+**Symptom:** `up{job="kubernetes-cadvisor"}` returned `0`, despite the target being discovered.
+ 
+```bash
+kubectl get --raw "/api/v1/nodes/<NODE_NAME>/proxy/metrics/cadvisor" | head -20
+kubectl get clusterrole prometheus -o yaml | grep -A 5 "resources:"
+```
+ 
+**Root cause:** the `ClusterRole` bound to Prometheus's service account included `nodes` and `nodes/metrics`, but not `nodes/proxy` — the specific subresource required by the cAdvisor proxy path. Without it, the API server rejected the scrape request with a 403 before it reached cAdvisor.
+ 
+**Fix:**
+```bash
+kubectl edit clusterrole prometheus
+```
+```yaml
+resources:
+  - nodes
+  - nodes/metrics
+  - nodes/proxy
+  - services
+  - endpoints
+  - pods
+```
+ 
+**Why we used this code:** RBAC permissions are evaluated live on every API request, so no restart was required — the fix took effect on Prometheus's next scrape cycle. `nodes/metrics` and `nodes/proxy` are distinct RBAC subresources: the former exposes summary node metrics, the latter permits proxying arbitrary requests to a node's kubelet, which the cAdvisor endpoint specifically requires.
+ 
+**Verification:** Prometheus UI → Status → Targets → `kubernetes-cadvisor` flipped from `DOWN` to `UP`.
+ 
+### Deploying kube-state-metrics (restart counts / object state)
+ 
+cAdvisor exposes only container resource usage; it has no visibility into Kubernetes object state such as pod restart counts. `kube-state-metrics` was deployed to close this gap.
+ 
+```bash
+kubectl apply -k https://github.com/kubernetes/kube-state-metrics/examples/standard
+kubectl get pods -n kube-system -l app.kubernetes.io/name=kube-state-metrics
+```
+ 
+**Why we used this code:** current releases of `kube-state-metrics` no longer publish a single bundled manifest; `kubectl apply -k` uses Kustomize to fetch and apply every manifest in the project's `examples/standard/` directory as one coherent unit.
+ 
+#### Troubleshooting — kube-state-metrics not scraped
+ 
+**Symptom:** `kube_pod_container_status_restarts_total` returned no data, despite the pod running healthily.
+ 
+**Diagnosis:** the `kubernetes-pods` job had no namespace restriction (so it does scan `kube-system`), but its relabel rule only keeps pods carrying `prometheus.io/scrape: "true"` — an annotation the upstream `kube-state-metrics` manifest does not set by default.
+ 
+**Fix:**
+```bash
+kubectl patch deployment kube-state-metrics -n kube-system -p \
+'{"spec":{"template":{"metadata":{"annotations":{"prometheus.io/scrape":"true","prometheus.io/port":"8080"}}}}}'
+```
+ 
+**Why we used this code:** `kubectl patch` adds the required annotations to the pod template without hand-editing the full manifest. This opts the pod into the existing `kubernetes-pods` job and specifies its metrics port, triggering an automatic rolling restart after which Prometheus picked it up.
+ 
+### 10.4 Grafana dashboard panels
+ 
+**Panel A — Microservices Memory Usage**
+```
+container_memory_usage_bytes{namespace="default", pod=~".*-service-.*|.*frontend.*|.*clickhouse.*"}
+```
+Visualization: Time series.
+ 
+**Panel B — Per-Service CPU Usage**
+```
+rate(container_cpu_usage_seconds_total{namespace="default", pod=~".*-service-.*|.*frontend.*|.*clickhouse.*"}[1m])
+```
+Visualization: Time series.
+ 
+**Why we used this code:** `container_cpu_usage_seconds_total` is a cumulative counter that only increases; wrapping it in `rate(...[1m])` converts it into cores used per second, averaged over a window wide enough to contain multiple 15-second scrape samples while remaining responsive to recent load changes.
+ 
+**Panel C — Pod Restart Counts**
+```
+kube_pod_container_status_restarts_total{namespace="default"}
+```
+Visualization: Bar gauge / Stat (a running total, not a rate).
+ 
+**Why we used this code:** this metric is the direct evidence of *availability* — the core requirement of this step. CPU and memory show resource pressure; restart count shows whether that pressure caused actual downtime.
+ 
+### 10.5 Evidence captured
+ 
+| # | Evidence | Confirms |
+|---|---|---|
+| 1 | Prometheus Status → Targets — `kubernetes-cadvisor` = `UP` | RBAC fix resolved the scrape failure |
+| 2 | Grafana — Microservices Memory Usage panel, all 6 workloads | Full scrape coverage |
+| 3 | Grafana — Pod Restart Counts panel | Availability evidence |
+| 4 | Grafana — Per-Service CPU Usage panel | Per-service resource monitoring |
+| 5 | Grafana — Cluster overview (memory/CPU/network) | Overall cluster health |
+| 6 | `kubectl get pods` terminal output, matching timestamp | Cross-reference dashboard vs actual state |
+ 
+---
+ 
+## Summary
+ 
+A Metabase instance was deployed for business-facing reporting on transactional data, connected to the existing RDS PostgreSQL instance with a dedicated metadata database. Separately, a Prometheus and Grafana stack was deployed for cluster-level observability, covering both container resource metrics (cAdvisor) and Kubernetes object-state metrics (`kube-state-metrics`). Two RBAC/configuration gaps were diagnosed and resolved during implementation — a missing `nodes/proxy` ClusterRole permission, and a missing scrape-opt-in annotation — both traced to root cause via direct inspection of live cluster configuration. Together, these two subsystems fulfil the coursework's requirements for business reporting and system health/performance/availability monitoring.
+
 ---
 
